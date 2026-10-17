@@ -49,6 +49,14 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
     mcp_test_p = mcp_sub.add_parser("test", help="Test MCP server connection")
     mcp_test_p.add_argument("name", help="Server name to test")
 
+    mcp_call_p = mcp_sub.add_parser("call", help="Call an MCP tool once and print its result")
+    mcp_call_p.add_argument("name", help="Server name")
+    mcp_call_p.add_argument(
+        "tool", help="Tool name as advertised by the server (no mcp_<server>_ prefix)")
+    mcp_call_p.add_argument(
+        "--args", dest="tool_args", default="{}", metavar="JSON",
+        help='Tool arguments as a JSON object (default: "{}")')
+
     mcp_cfg_p = mcp_sub.add_parser("configure", aliases=["config"], help="Toggle tool selection")
     mcp_cfg_p.add_argument("name", help="Server name to configure")
 

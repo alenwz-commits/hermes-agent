@@ -1,6 +1,7 @@
 """MCP Server Management CLI — ``hermes mcp`` subcommand."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -847,6 +848,143 @@ def cmd_mcp_test(args):
     return 0
 
 
+def _render_call_result(call: Any) -> str:
+    """Flatten a ``tools/call`` result to printable text.
+
+    Text content blocks join with newlines (what the server wrote); structured
+    JSON is the fallback for servers that answer only with structuredContent.
+    """
+    parts = []
+    for block in getattr(call, "content", None) or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+        elif block is not None:
+            parts.append(str(block))
+    if parts:
+        return "\n".join(parts)
+    structured = getattr(call, "structured_content", None)
+    if structured is None:
+        # Tolerate the wire-style alias some server wrappers expose.
+        structured = getattr(call, "structuredContent", None)
+    if structured is not None:
+        return json.dumps(structured, ensure_ascii=False, default=str)
+    return str(call)
+
+
+def _call_is_error(call: Any) -> bool:
+    """Read the tool-error flag from a ``tools/call`` result.
+
+    The installed mcp SDK models the field as ``is_error`` (snake_case); older
+    wrappers and the wire schema use ``isError``. E2E caught the camelCase-only
+    read silently downgrading every server error to exit 0.
+    """
+    flag = getattr(call, "is_error", None)
+    if flag is None:
+        flag = getattr(call, "isError", False)
+    return bool(flag)
+
+
+def _call_tool_once(
+    name: str, config: dict, tool: str, tool_args: dict, timeout: float
+) -> Tuple[bool, str]:
+    """Temporarily connect to one MCP server, call a single tool, disconnect.
+
+    Returns ``(is_error, text)``; raises on connection failure. Mirrors
+    ``_probe_single_server``'s connection machinery (env resolution, connect
+    claim, loop lifecycle, redaction) but issues ``tools/call`` instead of
+    ``tools/list``; ``timeout`` bounds the call itself after connection.
+    """
+    issues = validate_mcp_server_entry(name, config)
+    if issues:
+        raise ValueError("; ".join(issues))
+
+    from tools.mcp_tool_loop import _ensure_mcp_loop, _run_on_mcp_loop
+    from tools.mcp_tool_discovery import _connect_server
+    from tools.mcp_tool_lifecycle import _stop_mcp_loop_if_idle
+
+    config = _resolve_mcp_server_config(config)
+    try:
+        connect_timeout = max(1.0, float(config.get("connect_timeout", 30)))
+    except (TypeError, ValueError):
+        connect_timeout = 30.0
+    config["connect_timeout"] = connect_timeout
+
+    _ensure_mcp_loop()
+    outcome: Dict[str, Any] = {"is_error": False, "text": ""}
+
+    async def _call():
+        from tools import mcp_tool as _core
+
+        claimed = []
+        claim_token = _core._connect_server_claim.set(claimed.append)
+        try:
+            server = await asyncio.wait_for(_connect_server(name, config), timeout=connect_timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Connecting to MCP server '{name}' timed out after {connect_timeout}s "
+                "(bounded by connect_timeout)"
+            ) from None
+        finally:
+            _core._connect_server_claim.reset(claim_token)
+        try:
+            call = await asyncio.wait_for(
+                server.session.call_tool(tool, tool_args), timeout=timeout
+            )
+            outcome["is_error"] = _call_is_error(call)
+            outcome["text"] = _render_call_result(call)
+        finally:
+            await server.shutdown()
+
+    try:
+        _run_on_mcp_loop(_call(), timeout=connect_timeout + timeout)
+    except BaseException as exc:
+        raise _redact_probe_exception(exc) from None
+    finally:
+        _stop_mcp_loop_if_idle()
+    return outcome["is_error"], outcome["text"]
+
+
+def cmd_mcp_call(args):
+    """Call one MCP tool once and print its result.
+
+    Exit codes: 0 tool answered, 1 connection/tool error, 3 server not in the
+    config, 4 ``--args`` is not a JSON object (argparse owns 2 for usage errors).
+    """
+    name = getattr(args, "name", None)
+    cfg = _lookup_server(name, _get_mcp_servers(), "Available")
+    if cfg is None:
+        return 3
+    raw = getattr(args, "tool_args", None) or "{}"
+    try:
+        tool_args = json.loads(raw)
+    except (TypeError, ValueError):
+        _error(f"--args must be valid JSON: {raw!r}")
+        return 4
+    if not isinstance(tool_args, dict):
+        _error(f"--args must be a JSON object, got {type(tool_args).__name__}")
+        return 4
+    try:
+        timeout = float(cfg.get("timeout", 120) or 120)
+    except (TypeError, ValueError):
+        timeout = 120.0
+    tool = getattr(args, "tool", None)
+    print()
+    _info(f"Calling {name}.{tool} ...")
+    start = time.monotonic()
+    try:
+        is_error, text = _call_tool_once(name, cfg, tool, tool_args, timeout)
+    except Exception as exc:
+        _error(f"Call failed ({time.monotonic() - start:.1f}s): {_probe_failure_reason(exc)}")
+        _info(_probe_failure_next_step(name, exc))
+        return 1
+    if is_error:
+        _error(redact_mcp_probe_text(text) or "Tool returned an error")
+        return 1
+    print(text)
+    return 0
+
+
 def _reauth_oauth_server(name: str, server_config: dict, *, flow: str | None = None) -> bool:
     """Force a fresh OAuth flow for one server. Returns True on success.
 
@@ -1098,6 +1236,7 @@ _MCP_USAGE = (
     "hermes mcp remove <name>                      Remove a server",
     "hermes mcp list                               List configured servers",
     "hermes mcp test <name>                        Test connection",
+    "hermes mcp call <name> <tool> [--args JSON]   Call one tool, print its result",
     "hermes mcp configure <name>                   Toggle tools",
     "hermes mcp login <name>                       Re-authenticate OAuth",
     "hermes mcp reauth <name> | --all              Re-auth one or all OAuth servers",
@@ -1127,7 +1266,7 @@ def mcp_command(args):
         return
     handler = {
         "add": cmd_mcp_add, "remove": cmd_mcp_remove, "rm": cmd_mcp_remove, "list": cmd_mcp_list,
-        "ls": cmd_mcp_list, "test": cmd_mcp_test, "configure": cmd_mcp_configure,
+        "ls": cmd_mcp_list, "test": cmd_mcp_test, "call": cmd_mcp_call, "configure": cmd_mcp_configure,
         "config": cmd_mcp_configure, "login": cmd_mcp_login, "reauth": cmd_mcp_reauth,
     }.get(action)
     if handler:
